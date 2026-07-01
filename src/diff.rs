@@ -27,7 +27,6 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-use std::cmp::Ordering;
 use std::io;
 use std::io::Write;
 
@@ -47,7 +46,7 @@ use std::io::Write;
 ///
 /// ```rust
 /// use bsdiff::{diff, patch};
-/// 
+///
 /// // Create some test data
 /// let old_data = b"Hello, world!";
 /// let new_data = b"Hello, Rust!";
@@ -99,64 +98,312 @@ fn usz(i: isize) -> usize {
     i as usize
 }
 
-struct SplitParams {
-    start: usize,
-    len: usize,
+mod serial_suffix_sort {
+    use super::usz;
+    use std::cmp::Ordering;
+
+    struct SplitParams {
+        start: usize,
+        len: usize,
+    }
+
+    fn split_internal(
+        I: &mut [isize],
+        V: &mut [isize],
+        start: usize,
+        len: usize,
+        h: usize,
+    ) -> Option<SplitParams> {
+        if len < 16 {
+            let mut k = start;
+            while k < start + len {
+                let mut j = 1;
+                let mut x = V[usz(I[k] + h as isize)];
+                let mut i = 1;
+                while k + i < start + len {
+                    if V[usz(I[k + i] + h as isize)] < x {
+                        x = V[usz(I[k + i] + h as isize)];
+                        j = 0;
+                    }
+                    if V[usz(I[k + i] + h as isize)] == x {
+                        I.swap(k + j, k + i);
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                for &Ii in &I[k..k + j] {
+                    V[usz(Ii)] = k as isize + j as isize - 1;
+                }
+                if j == 1 {
+                    I[k] = -1;
+                }
+                k += j;
+            }
+
+            None
+        } else {
+            let x = V[usz(I[start + len / 2] + h as isize)];
+            let mut jj = 0;
+            let mut kk = 0;
+            for &Ii in &I[start..start + len] {
+                if V[usz(Ii + h as isize)] < x {
+                    jj += 1;
+                }
+                if V[usz(Ii + h as isize)] == x {
+                    kk += 1;
+                }
+            }
+            let jj = jj + start;
+            let kk = kk + jj;
+            let mut j = 0;
+            let mut k = 0;
+            let mut i = start;
+            while i < jj {
+                match V[usz(I[i] + h as isize)].cmp(&x) {
+                    Ordering::Less => i += 1,
+                    Ordering::Equal => {
+                        I.swap(i, jj + j);
+                        j += 1;
+                    }
+                    Ordering::Greater => {
+                        I.swap(i, kk + k);
+                        k += 1;
+                    }
+                }
+            }
+            while jj + j < kk {
+                if V[usz(I[jj + j] + h as isize)] == x {
+                    j += 1;
+                } else {
+                    I.swap(jj + j, kk + k);
+                    k += 1;
+                }
+            }
+            if jj > start {
+                split(I, V, start, jj - start, h);
+            }
+            for &Ii in &I[jj..kk] {
+                V[usz(Ii)] = kk as isize - 1;
+            }
+            if jj == kk - 1 {
+                I[jj] = -1;
+            }
+
+            if start + len > kk {
+                Some(SplitParams {
+                    start: kk,
+                    len: start + len - kk,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    fn split(I: &mut [isize], V: &mut [isize], start: usize, len: usize, h: usize) {
+        let mut ret = Some(SplitParams { start, len });
+        while let Some(params) = ret {
+            ret = split_internal(I, V, params.start, params.len, h);
+        }
+    }
+
+    pub(super) fn qsufsort(I: &mut [isize], V: &mut [isize], old: &[u8]) {
+        let mut buckets: [isize; 256] = [0; 256];
+        for &o in old {
+            buckets[o as usize] += 1;
+        }
+        for i in 1..256 {
+            buckets[i] += buckets[i - 1];
+        }
+        for i in (1..256).rev() {
+            buckets[i] = buckets[i - 1];
+        }
+        buckets[0] = 0;
+        for (i, old) in old.iter().copied().enumerate() {
+            buckets[old as usize] += 1;
+            I[usz(buckets[old as usize])] = i as isize;
+        }
+        I[0] = old.len() as isize;
+        for (i, old) in old.iter().copied().enumerate() {
+            V[i] = buckets[old as usize];
+        }
+        V[old.len()] = 0;
+        for i in 1..256 {
+            if buckets[i] == buckets[i - 1] + 1 {
+                I[usz(buckets[i])] = -1;
+            }
+        }
+        I[0] = -1;
+        let mut h = 1;
+        while I[0] != -(old.len() as isize + 1) {
+            let mut len = 0;
+            let mut i = 0;
+            while i < old.len() as isize + 1 {
+                if I[usz(i)] < 0 {
+                    len -= I[usz(i)];
+                    i -= I[usz(i)];
+                } else {
+                    if len != 0 {
+                        I[usz(i - len)] = -len;
+                    }
+                    len = V[usz(I[usz(i)])] + 1 - i;
+                    split(I, V, usz(i), usz(len), h);
+                    i += len;
+                    len = 0;
+                }
+            }
+            if len != 0 {
+                I[usz(i - len)] = -len;
+            }
+            h += h;
+        }
+        for (i, v) in V[0..=old.len()].iter().copied().enumerate() {
+            I[usz(v)] = i as isize;
+        }
+    }
 }
 
-fn split_internal(
-    I: &mut [isize],
-    V: &mut [isize],
-    start: usize,
-    len: usize,
-    h: usize,
-) -> Option<SplitParams> {
-    if len < 16 {
-        let mut k = start;
-        while k < start + len {
-            let mut j = 1;
-            let mut x = V[usz(I[k] + h as isize)];
-            let mut i = 1;
-            while k + i < start + len {
-                if V[usz(I[k + i] + h as isize)] < x {
-                    x = V[usz(I[k + i] + h as isize)];
-                    j = 0;
-                }
-                if V[usz(I[k + i] + h as isize)] == x {
-                    I.swap(k + j, k + i);
-                    j += 1;
-                }
-                i += 1;
+#[cfg(feature = "parallel")]
+mod suffix_sort {
+    use super::usz;
+    use rayon::prelude::*;
+    use std::cmp::Ordering;
+
+    const SPLIT_INSERTION_LIMIT: usize = 16;
+    const PARALLEL_BUCKET_CHUNK: usize = 16 * 1024;
+    const PARALLEL_GROUP_WORK: usize = 32 * 1024;
+    const PARALLEL_SPLIT_WORK: usize = 32 * 1024;
+    const PARALLEL_GROUP_LIMIT: usize = 4;
+    const PARALLEL_MIN_OLD_LEN: usize = 512 * 1024;
+
+    #[derive(Clone, Copy)]
+    struct SuffixGroup {
+        start: usize,
+        len: usize,
+    }
+
+    fn bucket_counts(old: &[u8]) -> [isize; 256] {
+        if old.len() < PARALLEL_BUCKET_CHUNK * 2 {
+            let mut buckets = [0; 256];
+            for &o in old {
+                buckets[o as usize] += 1;
             }
-            for &Ii in &I[k..k + j] {
-                V[usz(Ii)] = k as isize + j as isize - 1;
-            }
-            if j == 1 {
-                I[k] = -1;
-            }
-            k += j;
+            return buckets;
         }
 
-        None
-    } else {
-        let x = V[usz(I[start + len / 2] + h as isize)];
+        old.par_chunks(PARALLEL_BUCKET_CHUNK)
+            .map(|chunk| {
+                let mut buckets = [0; 256];
+                for &o in chunk {
+                    buckets[o as usize] += 1;
+                }
+                buckets
+            })
+            .reduce(
+                || [0; 256],
+                |mut left, right| {
+                    for i in 0..256 {
+                        left[i] += right[i];
+                    }
+                    left
+                },
+            )
+    }
+
+    #[inline]
+    fn rank_at(rank: &[isize], suffix: isize, h: usize) -> isize {
+        rank[usz(suffix + h as isize)]
+    }
+
+    fn collect_unsorted_groups(I: &mut [isize], V: &[isize], old_len: usize) -> Vec<SuffixGroup> {
+        let mut groups = Vec::new();
+        let mut len = 0;
+        let mut i = 0;
+
+        while i < old_len as isize + 1 {
+            if I[usz(i)] < 0 {
+                len -= I[usz(i)];
+                i -= I[usz(i)];
+            } else {
+                if len != 0 {
+                    I[usz(i - len)] = -len;
+                }
+                len = V[usz(I[usz(i)])] + 1 - i;
+                groups.push(SuffixGroup {
+                    start: usz(i),
+                    len: usz(len),
+                });
+                i += len;
+                len = 0;
+            }
+        }
+
+        if len != 0 {
+            I[usz(i - len)] = -len;
+        }
+
+        groups
+    }
+
+    fn split_rank(
+        I: &mut [isize],
+        base: usize,
+        rank: &[isize],
+        h: usize,
+        updates: &mut Vec<(usize, isize)>,
+    ) {
+        let len = I.len();
+        if len < SPLIT_INSERTION_LIMIT {
+            let mut k = 0;
+            while k < len {
+                let mut j = 1;
+                let mut x = rank_at(rank, I[k], h);
+                let mut i = 1;
+                while k + i < len {
+                    let y = rank_at(rank, I[k + i], h);
+                    if y < x {
+                        x = y;
+                        j = 0;
+                    }
+                    if y == x {
+                        I.swap(k + j, k + i);
+                        j += 1;
+                    }
+                    i += 1;
+                }
+
+                let group_end = (base + k + j - 1) as isize;
+                for &suffix in &I[k..k + j] {
+                    updates.push((usz(suffix), group_end));
+                }
+                if j == 1 {
+                    I[k] = -1;
+                }
+                k += j;
+            }
+
+            return;
+        }
+
+        let x = rank_at(rank, I[len / 2], h);
         let mut jj = 0;
         let mut kk = 0;
-        for &Ii in &I[start..start + len] {
-            if V[usz(Ii + h as isize)] < x {
+        for &suffix in I.iter() {
+            let suffix_rank = rank_at(rank, suffix, h);
+            if suffix_rank < x {
                 jj += 1;
             }
-            if V[usz(Ii + h as isize)] == x {
+            if suffix_rank == x {
                 kk += 1;
             }
         }
-        let jj = jj + start;
         let kk = kk + jj;
+
         let mut j = 0;
         let mut k = 0;
-        let mut i = start;
+        let mut i = 0;
         while i < jj {
-            match V[usz(I[i] + h as isize)].cmp(&x) {
+            match rank_at(rank, I[i], h).cmp(&x) {
                 Ordering::Less => i += 1,
                 Ordering::Equal => {
                     I.swap(i, jj + j);
@@ -169,95 +416,147 @@ fn split_internal(
             }
         }
         while jj + j < kk {
-            if V[usz(I[jj + j] + h as isize)] == x {
+            if rank_at(rank, I[jj + j], h) == x {
                 j += 1;
             } else {
                 I.swap(jj + j, kk + k);
                 k += 1;
             }
         }
-        if jj > start {
-            split(I, V, start, jj - start, h);
-        }
-        for &Ii in &I[jj..kk] {
-            V[usz(Ii)] = kk as isize - 1;
-        }
-        if jj == kk - 1 {
-            I[jj] = -1;
-        }
 
-        if start + len > kk {
-            Some(SplitParams {
-                start: kk,
-                len: start + len - kk,
-            })
+        let (left, rest) = I.split_at_mut(jj);
+        let (equal, right) = rest.split_at_mut(kk - jj);
+
+        if left.len() + right.len() >= PARALLEL_SPLIT_WORK && !left.is_empty() && !right.is_empty()
+        {
+            let (mut left_updates, mut right_updates) = rayon::join(
+                || {
+                    let mut updates = Vec::with_capacity(left.len());
+                    split_rank(left, base, rank, h, &mut updates);
+                    updates
+                },
+                || {
+                    let mut updates = Vec::with_capacity(right.len());
+                    split_rank(right, base + kk, rank, h, &mut updates);
+                    updates
+                },
+            );
+            updates.append(&mut left_updates);
+            updates.append(&mut right_updates);
         } else {
-            None
-        }
-    }
-}
-
-fn split(I: &mut [isize], V: &mut [isize], start: usize, len: usize, h: usize) {
-    let mut ret = Some(SplitParams { start, len });
-    while let Some(params) = ret {
-        ret = split_internal(I, V, params.start, params.len, h);
-    }
-}
-
-fn qsufsort(I: &mut [isize], V: &mut [isize], old: &[u8]) {
-    let mut buckets: [isize; 256] = [0; 256];
-    for &o in old {
-        buckets[o as usize] += 1;
-    }
-    for i in 1..256 {
-        buckets[i] += buckets[i - 1];
-    }
-    for i in (1..256).rev() {
-        buckets[i] = buckets[i - 1];
-    }
-    buckets[0] = 0;
-    for (i, old) in old.iter().copied().enumerate() {
-        buckets[old as usize] += 1;
-        I[usz(buckets[old as usize])] = i as isize;
-    }
-    I[0] = old.len() as isize;
-    for (i, old) in old.iter().copied().enumerate() {
-        V[i] = buckets[old as usize];
-    }
-    V[old.len()] = 0;
-    for i in 1..256 {
-        if buckets[i] == buckets[i - 1] + 1 {
-            I[usz(buckets[i])] = -1;
-        }
-    }
-    I[0] = -1;
-    let mut h = 1;
-    while I[0] != -(old.len() as isize + 1) {
-        let mut len = 0;
-        let mut i = 0;
-        while i < old.len() as isize + 1 {
-            if I[usz(i)] < 0 {
-                len -= I[usz(i)];
-                i = i - I[usz(i)];
-            } else {
-                if len != 0 {
-                    I[usz(i - len)] = -len;
-                }
-                len = V[usz(I[usz(i)])] + 1 - i;
-                split(I, V, usz(i), usz(len), h);
-                i += len;
-                len = 0;
+            if !left.is_empty() {
+                split_rank(left, base, rank, h, updates);
+            }
+            if !right.is_empty() {
+                split_rank(right, base + kk, rank, h, updates);
             }
         }
-        if len != 0 {
-            I[usz(i - len)] = -len;
+
+        let group_end = (base + kk - 1) as isize;
+        for &suffix in equal.iter() {
+            updates.push((usz(suffix), group_end));
         }
-        h += h;
+        if equal.len() == 1 {
+            equal[0] = -1;
+        }
     }
-    for (i, v) in V[0..=old.len()].iter().copied().enumerate() {
-        I[usz(v)] = i as isize;
+
+    fn split_groups(
+        I: &mut [isize],
+        base: usize,
+        groups: &[SuffixGroup],
+        rank: &[isize],
+        h: usize,
+    ) -> Vec<(usize, isize)> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+
+        let work = groups.iter().map(|group| group.len).sum::<usize>();
+        if groups.len() < PARALLEL_GROUP_LIMIT || work < PARALLEL_GROUP_WORK {
+            let mut updates = Vec::with_capacity(work);
+            for group in groups {
+                let start = group.start - base;
+                split_rank(
+                    &mut I[start..start + group.len],
+                    group.start,
+                    rank,
+                    h,
+                    &mut updates,
+                );
+            }
+            return updates;
+        }
+
+        let mid = groups.len() / 2;
+        let split_at = groups[mid].start;
+        let (left, right) = I.split_at_mut(split_at - base);
+        let (mut left_updates, mut right_updates) = rayon::join(
+            || split_groups(left, base, &groups[..mid], rank, h),
+            || split_groups(right, split_at, &groups[mid..], rank, h),
+        );
+        left_updates.append(&mut right_updates);
+        left_updates
+    }
+
+    pub(super) fn qsufsort(I: &mut [isize], V: &mut [isize], old: &[u8]) {
+        if old.len() < PARALLEL_MIN_OLD_LEN {
+            return super::serial_suffix_sort::qsufsort(I, V, old);
+        }
+
+        let mut buckets = bucket_counts(old);
+        for i in 1..256 {
+            buckets[i] += buckets[i - 1];
+        }
+        for i in (1..256).rev() {
+            buckets[i] = buckets[i - 1];
+        }
+        buckets[0] = 0;
+        for (i, old) in old.iter().copied().enumerate() {
+            buckets[old as usize] += 1;
+            I[usz(buckets[old as usize])] = i as isize;
+        }
+        I[0] = old.len() as isize;
+
+        if old.len() >= PARALLEL_BUCKET_CHUNK {
+            V[..old.len()]
+                .par_iter_mut()
+                .zip(old.par_iter().copied())
+                .for_each(|(rank, old)| *rank = buckets[old as usize]);
+        } else {
+            for (i, old) in old.iter().copied().enumerate() {
+                V[i] = buckets[old as usize];
+            }
+        }
+
+        V[old.len()] = 0;
+        for i in 1..256 {
+            if buckets[i] == buckets[i - 1] + 1 {
+                I[usz(buckets[i])] = -1;
+            }
+        }
+        I[0] = -1;
+        let mut h = 1;
+        let mut rank = vec![0; V.len()];
+        while I[0] != -(old.len() as isize + 1) {
+            let groups = collect_unsorted_groups(I, V, old.len());
+            rank.copy_from_slice(V);
+            let updates = split_groups(I, 0, &groups, &rank, h);
+            for (suffix, suffix_rank) in updates {
+                V[suffix] = suffix_rank;
+            }
+            h += h;
+        }
+        for (i, v) in V[0..=old.len()].iter().copied().enumerate() {
+            I[usz(v)] = i as isize;
+        }
     }
 }
+
+#[cfg(not(feature = "parallel"))]
+use serial_suffix_sort::qsufsort;
+#[cfg(feature = "parallel")]
+use suffix_sort::qsufsort;
 
 fn matchlen(old: &[u8], new: &[u8]) -> usize {
     old.iter().zip(new).take_while(|(a, b)| a == b).count()

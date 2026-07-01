@@ -55,3 +55,14 @@ fn patch_file(file_a: &str, patch_file: &str, file_b: &str) -> std::io::Result<(
     std::fs::write(file_b, &new)
 }
 ```
+
+## Benchmarks
+
+The default build enables the Rayon-backed suffix array construction. To compare it
+against the original serial sorter, save a Criterion baseline with default
+features disabled, then run the default benchmark against that baseline:
+
+```sh
+cargo bench --bench diff --no-default-features -- --save-baseline serial
+cargo bench --bench diff -- --baseline serial
+```

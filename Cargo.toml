@@ -10,8 +10,26 @@ license = "BSD-2-Clause"
 homepage = "https://lib.rs/bsdiff"
 repository = "https://github.com/space-wizards/bsdiff-rs"
 edition = "2021"
-include = ["src/*.rs", "LICENSE", "README.md", "Cargo.toml"]
-rust-version = "1.59"
+include = [
+    "src/*.rs",
+    "benches/*.rs",
+    "LICENSE",
+    "README.md",
+    "Cargo.toml",
+]
+rust-version = "1.80"
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+rayon = { version = "1.12", optional = true }
 
 [dev-dependencies]
+criterion = "0.5"
 smallvec = { version = "1.15.0", features = ["write"] }
+
+[[bench]]
+name = "diff"
+harness = false
