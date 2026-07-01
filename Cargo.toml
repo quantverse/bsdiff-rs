@@ -24,6 +24,7 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 
 [dependencies]
+cdivsufsort = "2.0.0"
 rayon = { version = "1.12", optional = true }
 
 [dev-dependencies]

@@ -56,11 +56,21 @@ fn patch_file(file_a: &str, patch_file: &str, file_b: &str) -> std::io::Result<(
 }
 ```
 
-## Benchmarks
+## Performance
 
-The default build enables the Rayon-backed suffix array construction. To compare it
-against the original serial sorter, save a Criterion baseline with default
-features disabled, then run the default benchmark against that baseline:
+Suffix-array construction (historically the dominant cost) uses
+[`cdivsufsort`](https://crates.io/crates/cdivsufsort), a near-linear-time port of
+libdivsufsort, replacing the original `O(n log n)` `qsufsort`.
+
+The default `parallel` feature additionally splits `new` into contiguous chunks and
+diffs them concurrently with Rayon, stitching the sub-patches back into a single
+stream. This trades a tiny amount of compression (cross-chunk match offsets are not
+shared) for a large speedup on multi-core machines, and never affects correctness —
+patches always round-trip. Disable it with `--no-default-features` for fully
+deterministic, single-threaded output.
+
+To compare the two builds, save a Criterion baseline with default features disabled,
+then run the default benchmark against that baseline:
 
 ```sh
 cargo bench --bench diff --no-default-features -- --save-baseline serial

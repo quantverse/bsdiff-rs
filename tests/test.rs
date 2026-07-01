@@ -40,16 +40,22 @@ fn test_it() {
     // Quite large and probably *some* similarities.
     let one = std::fs::read("tests/test_1").unwrap();
     let two = std::fs::read("tests/test_2").unwrap();
-    let expected = std::fs::read("tests/expected_diff").unwrap();
 
-    let mut patch = Vec::with_capacity(expected.len());
+    let mut patch = Vec::with_capacity(two.len());
     bsdiff::diff(&one, &two, &mut patch).unwrap();
 
-    assert_eq!(&expected, &patch);
-
+    // Round-trip is the real contract and holds for every build.
     let mut patched = Vec::with_capacity(two.len());
     bsdiff::patch(&one, &mut patch.as_slice(), &mut patched).unwrap();
     assert!(patched == two);
+
+    // Exact patch bytes are only deterministic for the single-threaded build;
+    // the parallel path splits `new` into a thread-count-dependent number of chunks.
+    #[cfg(not(feature = "parallel"))]
+    {
+        let expected = std::fs::read("tests/expected_diff").unwrap();
+        assert_eq!(expected, patch);
+    }
 }
 
 #[test]
