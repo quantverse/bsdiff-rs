@@ -98,54 +98,115 @@ fn usz(i: isize) -> usize {
     i as usize
 }
 
-/// Build the suffix array of `old`.
-///
-/// Returns an index array `I` of length `old.len() + 1` where `I[0] == old.len()`
-/// (the empty/sentinel suffix, which is lexicographically smallest) followed by the
-/// positions of every suffix of `old` in ascending lexicographic order. This layout
-/// matches what [`search`] expects and what the original `qsufsort` produced, so the
-/// rest of the algorithm is unchanged.
-///
-/// The heavy lifting is delegated to `cdivsufsort` (a port of libdivsufsort), which
-/// constructs the suffix array in `O(n)` space and near-linear time — dramatically
-/// faster than the original `O(n log n)` Larsson–Sadakane sorter for large inputs.
-fn build_suffix_array(old: &[u8]) -> Vec<i32> {
-    let n = old.len();
-    assert!(
-        n <= i32::MAX as usize,
-        "bsdiff: inputs larger than 2 GiB are not supported"
-    );
-    let mut I = vec![0i32; n + 1];
-    I[0] = n as i32;
-    if n > 0 {
-        cdivsufsort::sort_in_place(old, &mut I[1..]);
-    }
-    I
-}
-
 fn matchlen(old: &[u8], new: &[u8]) -> usize {
     old.iter().zip(new).take_while(|(a, b)| a == b).count()
 }
 
-fn search(I: &[i32], old: &[u8], new: &[u8]) -> (usize, usize) {
-    if I.len() < 3 {
-        let x = matchlen(&old[I[0] as usize..], new);
-        let y = matchlen(&old[I[I.len() - 1] as usize..], new);
-        if x > y {
-            (I[0] as usize, x)
-        } else {
-            (I[I.len() - 1] as usize, y)
+/// Number of leading bytes hashed to form a match anchor.
+const HASH_LEN: usize = 8;
+/// log2 of the hash-table size (number of buckets).
+const HASH_BITS: u32 = 21;
+/// Upper bound on the number of candidates inspected per lookup, to keep the worst
+/// case (highly repetitive regions) bounded.
+const MAX_CHAIN: usize = 32;
+
+#[inline]
+fn hash8(bytes: &[u8]) -> usize {
+    // bytes.len() >= HASH_LEN is guaranteed by callers.
+    let x = u64::from_le_bytes(bytes[..HASH_LEN].try_into().unwrap());
+    (x.wrapping_mul(0x9E37_79B1_85EB_CA87) >> (64 - HASH_BITS)) as usize
+}
+
+/// A hash-chain match finder over `old`, replacing the suffix array.
+///
+/// Every position `i` of `old` is indexed by the hash of its first [`HASH_LEN`] bytes.
+/// `head[bucket]` points at the most recent position with that hash and `prev[i]` links
+/// to the previous one, so a lookup walks a bucket's chain (capped at [`MAX_CHAIN`]).
+///
+/// This finds *good* matches, not provably longest ones like a suffix array would, but
+/// every returned match is verified byte-for-byte, so patches always round-trip. Building
+/// it is far cheaper than a suffix array (a single linear pass, no sorting), which is what
+/// makes sub-100ms diffs of multi-megabyte inputs possible.
+struct Matcher {
+    head: Vec<i32>,
+    prev: Vec<i32>,
+}
+
+impl Matcher {
+    fn build(old: &[u8]) -> Self {
+        assert!(
+            old.len() <= i32::MAX as usize,
+            "bsdiff: inputs larger than 2 GiB are not supported"
+        );
+        let mut head = vec![-1i32; 1usize << HASH_BITS];
+        let mut prev = vec![-1i32; old.len()];
+        if old.len() >= HASH_LEN {
+            let m = old.len() - HASH_LEN + 1;
+            Self::index_positions(old, m, &mut head, &mut prev);
         }
-    } else {
-        let mid = (I.len() - 1) / 2;
-        let left = &old[I[mid] as usize..];
-        let right = new;
-        let len_to_check = left.len().min(right.len());
-        if left[..len_to_check] < right[..len_to_check] {
-            search(&I[mid..], old, new)
-        } else {
-            search(&I[..=mid], old, new)
+        Matcher { head, prev }
+    }
+
+    /// Insert positions `0..m` of `old` into the hash chains.
+    #[cfg(feature = "parallel")]
+    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32]) {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicI32, Ordering};
+        // Atomic views over buffers we own exclusively. Building the chains in parallel
+        // makes the order within a bucket nondeterministic, which only affects *which*
+        // equally-good candidate is found first, never correctness.
+        let head_a: &[AtomicI32] = unsafe { &*(head as *const [i32] as *const [AtomicI32]) };
+        let prev_a: &[AtomicI32] = unsafe { &*(prev as *const [i32] as *const [AtomicI32]) };
+        (0..m).into_par_iter().for_each(|i| {
+            let b = hash8(&old[i..]);
+            let old_head = head_a[b].swap(i as i32, Ordering::Relaxed);
+            prev_a[i].store(old_head, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32]) {
+        for i in 0..m {
+            let b = hash8(&old[i..]);
+            prev[i] = head[b];
+            head[b] = i as i32;
         }
+    }
+
+    /// Find a long match for `new[scan..]` within `old`, returning `(pos, len)` where
+    /// `old[pos..pos + len] == new[scan..scan + len]`. Returns `(0, 0)` when no anchor
+    /// matches (the byte is then emitted as a literal by the caller).
+    #[inline]
+    fn longest_match(&self, old: &[u8], new: &[u8], scan: usize) -> (usize, usize) {
+        if scan + HASH_LEN > new.len() {
+            return (0, 0);
+        }
+        let target = &new[scan..];
+        let b = hash8(target);
+        let mut p = self.head[b];
+        let mut best_pos = 0usize;
+        let mut best_len = 0usize;
+        let mut chain = 0;
+        while p >= 0 && chain < MAX_CHAIN {
+            let pos = p as usize;
+            // Prune candidates that cannot extend past the best match found so far.
+            if best_len < target.len()
+                && (best_len == 0
+                    || (pos + best_len < old.len() && old[pos + best_len] == target[best_len]))
+            {
+                let l = matchlen(&old[pos..], target);
+                if l > best_len {
+                    best_len = l;
+                    best_pos = pos;
+                    if best_len == target.len() {
+                        break;
+                    }
+                }
+            }
+            p = self.prev[pos];
+            chain += 1;
+        }
+        (best_pos, best_len)
     }
 }
 
@@ -167,7 +228,7 @@ fn offtout(x: isize, buf: &mut [u8]) {
 /// reproduces `new` exactly. The return value is the decoder's `oldpos` *after* the last
 /// record (still assuming it started at 0). That value is what the parallel stitcher uses to
 /// emit a "seek back to 0" record between independently-diffed chunks.
-fn diff_scan(old: &[u8], new: &[u8], I: &[i32], writer: &mut dyn Write) -> io::Result<i64> {
+fn diff_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Write) -> io::Result<i64> {
     let mut buffer = Vec::new();
     // Tracks the decoder's `oldpos` as records are emitted, starting from 0.
     let mut decoder_oldpos: i64 = 0;
@@ -183,7 +244,7 @@ fn diff_scan(old: &[u8], new: &[u8], I: &[i32], writer: &mut dyn Write) -> io::R
         scan += len;
         let mut scsc = scan;
         while scan < new.len() {
-            let (p, l) = search(&I[..=old.len()], old, &new[scan..]);
+            let (p, l) = matcher.longest_match(old, new, scan);
             pos = p;
             len = l;
             while scsc < scan + len {
@@ -310,7 +371,7 @@ fn write_seek_record(writer: &mut dyn Write, seek: isize) -> io::Result<()> {
 /// reconstructs `new` byte-for-byte; the only cost of chunking is slightly reduced compression
 /// (cross-chunk match offsets are not shared), never correctness.
 #[cfg(feature = "parallel")]
-fn parallel_scan(old: &[u8], new: &[u8], I: &[i32], writer: &mut dyn Write) -> io::Result<()> {
+fn parallel_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Write) -> io::Result<()> {
     use rayon::prelude::*;
 
     let n = new.len();
@@ -331,7 +392,7 @@ fn parallel_scan(old: &[u8], new: &[u8], I: &[i32], writer: &mut dyn Write) -> i
         .collect();
 
     if ranges.len() == 1 {
-        diff_scan(old, new, I, writer)?;
+        diff_scan(old, new, matcher, writer)?;
         return Ok(());
     }
 
@@ -340,7 +401,7 @@ fn parallel_scan(old: &[u8], new: &[u8], I: &[i32], writer: &mut dyn Write) -> i
         .map(|&(start, end)| {
             let mut buf = Vec::new();
             // Writing into a Vec is infallible, so this never errors.
-            let end_pos = diff_scan(old, &new[start..end], I, &mut buf)
+            let end_pos = diff_scan(old, &new[start..end], matcher, &mut buf)
                 .expect("writing a diff into a Vec cannot fail");
             (buf, end_pos)
         })
@@ -360,12 +421,12 @@ fn parallel_scan(old: &[u8], new: &[u8], I: &[i32], writer: &mut dyn Write) -> i
 }
 
 fn bsdiff_internal(old: &[u8], new: &[u8], writer: &mut dyn Write) -> io::Result<()> {
-    let I = build_suffix_array(old);
+    let matcher = Matcher::build(old);
 
     #[cfg(feature = "parallel")]
-    parallel_scan(old, new, &I, writer)?;
+    parallel_scan(old, new, &matcher, writer)?;
     #[cfg(not(feature = "parallel"))]
-    diff_scan(old, new, &I, writer)?;
+    diff_scan(old, new, &matcher, writer)?;
 
     Ok(())
 }

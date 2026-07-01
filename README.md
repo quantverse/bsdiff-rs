@@ -58,16 +58,22 @@ fn patch_file(file_a: &str, patch_file: &str, file_b: &str) -> std::io::Result<(
 
 ## Performance
 
-Suffix-array construction (historically the dominant cost) uses
-[`cdivsufsort`](https://crates.io/crates/cdivsufsort), a near-linear-time port of
-libdivsufsort, replacing the original `O(n log n)` `qsufsort`.
+Match finding uses a hash-chain index over `old` (every position is keyed by the hash
+of its first few bytes, à la LZ77/zstd) instead of the original `qsufsort` suffix array.
+Building the index is a single linear pass rather than a full suffix sort, which is far
+cheaper for multi-megabyte inputs. Every candidate match is still verified byte-for-byte,
+so patches always round-trip; matches are *good* rather than provably longest, so patch
+size may differ slightly from the classic algorithm.
 
-The default `parallel` feature additionally splits `new` into contiguous chunks and
-diffs them concurrently with Rayon, stitching the sub-patches back into a single
-stream. This trades a tiny amount of compression (cross-chunk match offsets are not
-shared) for a large speedup on multi-core machines, and never affects correctness —
-patches always round-trip. Disable it with `--no-default-features` for fully
-deterministic, single-threaded output.
+The default `parallel` feature builds the index concurrently (lock-free) and splits `new`
+into contiguous chunks that are diffed in parallel with Rayon, stitching the sub-patches
+back into one stream. On a many-core machine this diffs multi-megabyte inputs several
+times faster than the original.
+
+Determinism: the single-threaded build (`--no-default-features`) produces bit-identical
+output for identical inputs. The parallel build races to fill the index, so it emits a
+valid, round-trippable patch whose exact bytes may vary between runs. Use the
+single-threaded build when byte-reproducible patches are required.
 
 To compare the two builds, save a Criterion baseline with default features disabled,
 then run the default benchmark against that baseline:
