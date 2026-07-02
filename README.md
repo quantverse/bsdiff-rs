@@ -65,15 +65,15 @@ cheaper for multi-megabyte inputs. Every candidate match is still verified byte-
 so patches always round-trip; matches are *good* rather than provably longest, so patch
 size may differ slightly from the classic algorithm.
 
-The default `parallel` feature builds the index concurrently (lock-free) and splits `new`
-into contiguous chunks that are diffed in parallel with Rayon, stitching the sub-patches
-back into one stream. On a many-core machine this diffs multi-megabyte inputs several
-times faster than the original.
+The default `parallel` feature builds the index concurrently and splits `new` into
+contiguous fixed-size chunks that are diffed in parallel with Rayon, stitching the
+sub-patches back into one stream. On a many-core machine this diffs multi-megabyte
+inputs several times faster than the original.
 
-Determinism: the single-threaded build (`--no-default-features`) produces bit-identical
-output for identical inputs. The parallel build races to fill the index, so it emits a
-valid, round-trippable patch whose exact bytes may vary between runs. Use the
-single-threaded build when byte-reproducible patches are required.
+Determinism: both builds produce bit-identical output for identical inputs — patch
+bytes never depend on thread count, core count, or scheduling. The two builds differ
+from *each other* (chunking inserts seek records between chunk sub-patches), so pick
+one build per artifact pipeline when comparing patches by hash.
 
 To compare the two builds, save a Criterion baseline with default features disabled,
 then run the default benchmark against that baseline:

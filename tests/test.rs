@@ -49,13 +49,40 @@ fn test_it() {
     bsdiff::patch(&one, &mut patch.as_slice(), &mut patched).unwrap();
     assert!(patched == two);
 
-    // Exact patch bytes are only deterministic for the single-threaded build;
-    // the parallel path splits `new` into a thread-count-dependent number of chunks.
+    // Patch bytes are deterministic in both builds. The parallel path has its own
+    // golden file: it chunks `new` at fixed 256 KiB boundaries (adding seek records),
+    // so its output differs from the serial encoder's — but never between machines,
+    // thread counts, or runs.
+    #[cfg(feature = "parallel")]
+    let expected = std::fs::read("tests/expected_diff_parallel").unwrap();
     #[cfg(not(feature = "parallel"))]
-    {
-        let expected = std::fs::read("tests/expected_diff").unwrap();
-        assert_eq!(expected, patch);
-    }
+    let expected = std::fs::read("tests/expected_diff").unwrap();
+    assert!(expected == patch, "patch bytes differ from golden file");
+}
+
+/// Patch bytes must depend only on the input, not on the machine: the same diff run
+/// under 1-, 2-, and 7-thread pools has to produce identical bytes.
+#[test]
+#[cfg(feature = "parallel")]
+fn test_parallel_output_thread_count_independent() {
+    let one = std::fs::read("tests/test_1").unwrap();
+    let two = std::fs::read("tests/test_2").unwrap();
+    let patches: Vec<Vec<u8>> = [1usize, 2, 7]
+        .iter()
+        .map(|&threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut patch = Vec::new();
+                bsdiff::diff(&one, &two, &mut patch).unwrap();
+                patch
+            })
+        })
+        .collect();
+    assert!(patches[0] == patches[1], "1-thread and 2-thread patches differ");
+    assert!(patches[1] == patches[2], "2-thread and 7-thread patches differ");
 }
 
 // The allocation is virtual (zeroed pages); diff must reject `old` before reading it.

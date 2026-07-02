@@ -28,6 +28,7 @@ rayon = { version = "1.12", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+rayon = "1.12"
 smallvec = { version = "1.15.0", features = ["write"] }
 
 [[bench]]

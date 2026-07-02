@@ -139,16 +139,22 @@ fn hash8(bytes: &[u8], bits: u32) -> usize {
 /// A hash-chain match finder over `old`, replacing the suffix array.
 ///
 /// Every position `i` of `old` is indexed by the hash of its first [`HASH_LEN`] bytes.
-/// `head[bucket]` points at the most recent position with that hash and `prev[i]` links
-/// to the previous one, so a lookup walks a bucket's chain (capped at [`MAX_CHAIN`]).
+/// Buckets are stored CSR-style: `positions[offsets[b]..offsets[b + 1]]` holds every
+/// position whose anchor hashes to bucket `b`, sorted by descending position; a lookup
+/// scans that slice (capped at [`MAX_CHAIN`] candidates).
+///
+/// The layout is fully deterministic — serial and parallel builds produce identical
+/// tables, so patch bytes never depend on thread count or scheduling. (An earlier
+/// linked-chain design built with atomic swaps made within-bucket order a data race,
+/// which leaked into the emitted patch bytes.)
 ///
 /// This finds *good* matches, not provably longest ones like a suffix array would, but
 /// every returned match is verified byte-for-byte, so patches always round-trip. Building
-/// it is far cheaper than a suffix array (a single linear pass, no sorting), which is what
-/// makes sub-100ms diffs of multi-megabyte inputs possible.
+/// it is far cheaper than a suffix array (counting sort by bucket, no suffix ordering),
+/// which is what makes sub-100ms diffs of multi-megabyte inputs possible.
 struct Matcher {
-    head: Vec<i32>,
-    prev: Vec<i32>,
+    offsets: Vec<u32>,
+    positions: Vec<i32>,
     bits: u32,
 }
 
@@ -158,42 +164,106 @@ impl Matcher {
     fn build(old: &[u8]) -> Self {
         debug_assert!(old.len() <= i32::MAX as usize);
         let bits = bits_for(old.len());
-        let mut head = vec![-1i32; 1usize << bits];
-        let mut prev = vec![-1i32; old.len()];
-        if old.len() >= HASH_LEN {
-            let m = old.len() - HASH_LEN + 1;
-            Self::index_positions(old, m, &mut head, &mut prev, bits);
+        let m = if old.len() >= HASH_LEN {
+            old.len() - HASH_LEN + 1
+        } else {
+            0
+        };
+        let (offsets, positions) = Self::build_index(old, m, bits);
+        Matcher {
+            offsets,
+            positions,
+            bits,
         }
-        Matcher { head, prev, bits }
     }
 
-    /// Insert positions `0..m` of `old` into the hash chains.
+    /// Index positions `0..m` of `old`: count bucket sizes, prefix-sum into `offsets`,
+    /// then scatter positions so every bucket slice is sorted by descending position.
     #[cfg(feature = "parallel")]
-    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32], bits: u32) {
+    fn build_index(old: &[u8], m: usize, bits: u32) -> (Vec<u32>, Vec<i32>) {
         use rayon::prelude::*;
-        use std::sync::atomic::{AtomicI32, Ordering};
-        // Atomic views over buffers we own exclusively. Building the chains in parallel
-        // makes the order within a bucket nondeterministic, which only affects *which*
-        // equally-good candidate is found first, never correctness.
-        // The casts must go through `*mut` to keep write provenance: `&mut [i32] as
-        // *const [i32]` would reborrow through a shared read-only reference first,
-        // making the atomic stores below undefined behavior (flagged by Miri).
-        let head_a: &[AtomicI32] = unsafe { &*(head as *mut [i32] as *const [AtomicI32]) };
-        let prev_a: &[AtomicI32] = unsafe { &*(prev as *mut [i32] as *const [AtomicI32]) };
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+        let nb = 1usize << bits;
+        // Atomic views over buffers we own exclusively. The casts must go through
+        // `*mut` to keep write provenance: `&mut [_] as *const [_]` would reborrow
+        // through a shared read-only reference first, making the atomic stores below
+        // undefined behavior (flagged by Miri).
+        let mut counts = vec![0u32; nb];
+        let counts_a: &[AtomicU32] =
+            unsafe { &*(counts.as_mut_slice() as *mut [u32] as *const [AtomicU32]) };
+        (0..m).into_par_iter().for_each(|i| {
+            counts_a[hash8(&old[i..], bits)].fetch_add(1, Ordering::Relaxed);
+        });
+
+        let mut offsets = vec![0u32; nb + 1];
+        for b in 0..nb {
+            offsets[b + 1] = offsets[b] + counts[b];
+            // Reuse `counts` as the scatter cursors.
+            counts[b] = offsets[b];
+        }
+        let cursors: &[AtomicU32] =
+            unsafe { &*(counts.as_mut_slice() as *mut [u32] as *const [AtomicU32]) };
+
+        // Scatter in parallel (slot assignment within a bucket is racy), then sort
+        // each bucket slice to make the final order deterministic.
+        let mut positions = vec![0i32; m];
+        let positions_a: &[AtomicI32] =
+            unsafe { &*(positions.as_mut_slice() as *mut [i32] as *const [AtomicI32]) };
         (0..m).into_par_iter().for_each(|i| {
             let b = hash8(&old[i..], bits);
-            let old_head = head_a[b].swap(i as i32, Ordering::Relaxed);
-            prev_a[i].store(old_head, Ordering::Relaxed);
+            let slot = cursors[b].fetch_add(1, Ordering::Relaxed) as usize;
+            positions_a[slot].store(i as i32, Ordering::Relaxed);
         });
+        Self::sort_buckets(&offsets, 0, nb, &mut positions);
+        (offsets, positions)
+    }
+
+    /// Sort every bucket slice of `positions` in descending order, splitting the
+    /// bucket range recursively so disjoint slices are sorted in parallel.
+    /// `positions` covers buckets `lo..hi`; its first element is at global offset
+    /// `offsets[lo]`.
+    #[cfg(feature = "parallel")]
+    fn sort_buckets(offsets: &[u32], lo: usize, hi: usize, positions: &mut [i32]) {
+        const LEAF_BUCKETS: usize = 1 << 12;
+        let base = offsets[lo];
+        if hi - lo <= LEAF_BUCKETS {
+            for b in lo..hi {
+                let s = (offsets[b] - base) as usize;
+                let e = (offsets[b + 1] - base) as usize;
+                positions[s..e].sort_unstable_by(|x, y| y.cmp(x));
+            }
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        let (left, right) = positions.split_at_mut((offsets[mid] - base) as usize);
+        rayon::join(
+            || Self::sort_buckets(offsets, lo, mid, left),
+            || Self::sort_buckets(offsets, mid, hi, right),
+        );
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32], bits: u32) {
+    fn build_index(old: &[u8], m: usize, bits: u32) -> (Vec<u32>, Vec<i32>) {
+        let nb = 1usize << bits;
+        let mut offsets = vec![0u32; nb + 1];
         for i in 0..m {
-            let b = hash8(&old[i..], bits);
-            prev[i] = head[b];
-            head[b] = i as i32;
+            offsets[hash8(&old[i..], bits) + 1] += 1;
         }
+        let mut cursors = vec![0u32; nb];
+        for b in 0..nb {
+            offsets[b + 1] += offsets[b];
+            cursors[b] = offsets[b];
+        }
+        // Scattering positions in descending order leaves every bucket slice sorted
+        // descending, matching the parallel build's post-sort layout exactly.
+        let mut positions = vec![0i32; m];
+        for i in (0..m).rev() {
+            let b = hash8(&old[i..], bits);
+            positions[cursors[b] as usize] = i as i32;
+            cursors[b] += 1;
+        }
+        (offsets, positions)
     }
 
     /// Find a long match for `new[scan..]` within `old`, returning `(pos, len)` where
@@ -206,11 +276,13 @@ impl Matcher {
         }
         let target = &new[scan..];
         let b = hash8(target, self.bits);
-        let mut p = self.head[b];
+        let start = self.offsets[b] as usize;
+        let end = (self.offsets[b + 1] as usize).min(start + MAX_CHAIN);
         let mut best_pos = 0usize;
         let mut best_len = 0usize;
-        let mut chain = 0;
-        while p >= 0 && chain < MAX_CHAIN {
+        // Candidates are sorted by descending position: most recent first, the same
+        // order the previous linked-chain walk visited them in.
+        for &p in &self.positions[start..end] {
             let pos = p as usize;
             // Prune candidates that cannot extend past the best match found so far.
             if best_len < target.len()
@@ -226,8 +298,6 @@ impl Matcher {
                     }
                 }
             }
-            p = self.prev[pos];
-            chain += 1;
         }
         (best_pos, best_len)
     }
@@ -406,16 +476,16 @@ fn parallel_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Wri
         return Ok(());
     }
 
-    // Keep chunks large enough that per-chunk overhead stays negligible, but small enough
-    // to give every worker several chunks for load balancing.
-    const MIN_CHUNK: usize = 256 * 1024;
-    let threads = rayon::current_num_threads().max(1);
-    let target_chunks = (threads * 4).max(1);
-    let chunk = ((n + target_chunks - 1) / target_chunks).max(MIN_CHUNK);
+    // The chunk size is a fixed constant, NOT derived from the thread count: chunk
+    // boundaries determine where seek records fall, so patch bytes must depend only
+    // on the input. Rayon load-balances the chunks across however many threads exist.
+    // 256 KiB keeps per-chunk overhead (one 24-byte seek record, lost cross-boundary
+    // match context) negligible while still splitting small inputs enough to matter.
+    const CHUNK: usize = 256 * 1024;
 
     let ranges: Vec<(usize, usize)> = (0..n)
-        .step_by(chunk)
-        .map(|start| (start, (start + chunk).min(n)))
+        .step_by(CHUNK)
+        .map(|start| (start, (start + CHUNK).min(n)))
         .collect();
 
     if ranges.len() == 1 {
