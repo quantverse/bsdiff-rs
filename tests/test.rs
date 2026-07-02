@@ -58,6 +58,16 @@ fn test_it() {
     }
 }
 
+// The allocation is virtual (zeroed pages); diff must reject `old` before reading it.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn test_old_larger_than_2gib_returns_err() {
+    let old = vec![0u8; i32::MAX as usize + 1];
+    let mut patch = Vec::new();
+    let err = bsdiff::diff(&old, b"new data", &mut patch).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
 #[test]
 fn test_truncated_patch() {
     let one = vec![1, 2, 3];

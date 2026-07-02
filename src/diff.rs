@@ -37,6 +37,11 @@ use std::io::Write;
 /// # Generic Parameters
 ///
 /// * `T: Read` - Any readable source for patch data (e.g., `File`, `Cursor<Vec<u8>>`, `&[u8]`)
+///
+/// # Errors
+///
+/// Returns [`std::io::ErrorKind::InvalidInput`] if `old` is larger than 2 GiB
+/// (match positions are stored as `i32`), and propagates any error from `writer`.
 /// * `W: Write + DerefMut<Target = [u8]>` - Any writable buffer that can be treated as a mutable byte slice
 ///   (e.g., `Vec<u8>`, `AlignedVec`, `SmallVec`, custom buffer types)
 ///
@@ -104,17 +109,31 @@ fn matchlen(old: &[u8], new: &[u8]) -> usize {
 
 /// Number of leading bytes hashed to form a match anchor.
 const HASH_LEN: usize = 8;
-/// log2 of the hash-table size (number of buckets).
-const HASH_BITS: u32 = 21;
+/// Bounds on the hash-table size (log2 of the number of buckets).
+const MIN_HASH_BITS: u32 = 12;
+const MAX_HASH_BITS: u32 = 25;
 /// Upper bound on the number of candidates inspected per lookup, to keep the worst
 /// case (highly repetitive regions) bounded.
 const MAX_CHAIN: usize = 32;
 
+/// Hash-table size for an input of `len` bytes, as log2 of the bucket count.
+///
+/// Sized for an average bucket load of ~4. The table must scale with the input:
+/// with a fixed-size table, unrelated 8-grams collide into the same buckets once
+/// the input outgrows it, and those colliders exhaust the [`MAX_CHAIN`] walk before
+/// it reaches a real match — for a 256 MiB input a fixed 21-bit table averaged 128
+/// entries per bucket, losing every long-range match and slowing lookups ~100x.
+/// Scaling also keeps small inputs from paying for a table sized for large ones.
+fn bits_for(len: usize) -> u32 {
+    let ceil_log2 = (len.max(2) - 1).ilog2() + 1;
+    ceil_log2.saturating_sub(2).clamp(MIN_HASH_BITS, MAX_HASH_BITS)
+}
+
 #[inline]
-fn hash8(bytes: &[u8]) -> usize {
+fn hash8(bytes: &[u8], bits: u32) -> usize {
     // bytes.len() >= HASH_LEN is guaranteed by callers.
     let x = u64::from_le_bytes(bytes[..HASH_LEN].try_into().unwrap());
-    (x.wrapping_mul(0x9E37_79B1_85EB_CA87) >> (64 - HASH_BITS)) as usize
+    (x.wrapping_mul(0x9E37_79B1_85EB_CA87) >> (64 - bits)) as usize
 }
 
 /// A hash-chain match finder over `old`, replacing the suffix array.
@@ -130,26 +149,27 @@ fn hash8(bytes: &[u8]) -> usize {
 struct Matcher {
     head: Vec<i32>,
     prev: Vec<i32>,
+    bits: u32,
 }
 
 impl Matcher {
+    /// Caller ensures `old.len() <= i32::MAX` (positions are stored as `i32`);
+    /// `bsdiff_internal` rejects larger inputs with an error before building.
     fn build(old: &[u8]) -> Self {
-        assert!(
-            old.len() <= i32::MAX as usize,
-            "bsdiff: inputs larger than 2 GiB are not supported"
-        );
-        let mut head = vec![-1i32; 1usize << HASH_BITS];
+        debug_assert!(old.len() <= i32::MAX as usize);
+        let bits = bits_for(old.len());
+        let mut head = vec![-1i32; 1usize << bits];
         let mut prev = vec![-1i32; old.len()];
         if old.len() >= HASH_LEN {
             let m = old.len() - HASH_LEN + 1;
-            Self::index_positions(old, m, &mut head, &mut prev);
+            Self::index_positions(old, m, &mut head, &mut prev, bits);
         }
-        Matcher { head, prev }
+        Matcher { head, prev, bits }
     }
 
     /// Insert positions `0..m` of `old` into the hash chains.
     #[cfg(feature = "parallel")]
-    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32]) {
+    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32], bits: u32) {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicI32, Ordering};
         // Atomic views over buffers we own exclusively. Building the chains in parallel
@@ -161,16 +181,16 @@ impl Matcher {
         let head_a: &[AtomicI32] = unsafe { &*(head as *mut [i32] as *const [AtomicI32]) };
         let prev_a: &[AtomicI32] = unsafe { &*(prev as *mut [i32] as *const [AtomicI32]) };
         (0..m).into_par_iter().for_each(|i| {
-            let b = hash8(&old[i..]);
+            let b = hash8(&old[i..], bits);
             let old_head = head_a[b].swap(i as i32, Ordering::Relaxed);
             prev_a[i].store(old_head, Ordering::Relaxed);
         });
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32]) {
+    fn index_positions(old: &[u8], m: usize, head: &mut [i32], prev: &mut [i32], bits: u32) {
         for i in 0..m {
-            let b = hash8(&old[i..]);
+            let b = hash8(&old[i..], bits);
             prev[i] = head[b];
             head[b] = i as i32;
         }
@@ -185,7 +205,7 @@ impl Matcher {
             return (0, 0);
         }
         let target = &new[scan..];
-        let b = hash8(target);
+        let b = hash8(target, self.bits);
         let mut p = self.head[b];
         let mut best_pos = 0usize;
         let mut best_len = 0usize;
@@ -428,6 +448,12 @@ fn parallel_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Wri
 }
 
 fn bsdiff_internal(old: &[u8], new: &[u8], writer: &mut dyn Write) -> io::Result<()> {
+    if old.len() > i32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bsdiff: `old` inputs larger than 2 GiB are not supported",
+        ));
+    }
     let matcher = Matcher::build(old);
 
     #[cfg(feature = "parallel")]
@@ -436,4 +462,21 @@ fn bsdiff_internal(old: &[u8], new: &[u8], writer: &mut dyn Write) -> io::Result
     diff_scan(old, new, &matcher, writer)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bits_for, MAX_HASH_BITS, MIN_HASH_BITS};
+
+    #[test]
+    fn hash_table_scales_with_input() {
+        assert_eq!(bits_for(0), MIN_HASH_BITS);
+        assert_eq!(bits_for(1 << 14), MIN_HASH_BITS);
+        // Load factor ~4: a 4 MiB input gets a 2^20-bucket table.
+        assert_eq!(bits_for(4 << 20), 20);
+        assert_eq!(bits_for(64 << 20), 24);
+        // Capped: table growth stops at 2^25 buckets (128 MiB of i32s).
+        assert_eq!(bits_for(256 << 20), MAX_HASH_BITS);
+        assert_eq!(bits_for(usize::MAX), MAX_HASH_BITS);
+    }
 }
