@@ -155,8 +155,11 @@ impl Matcher {
         // Atomic views over buffers we own exclusively. Building the chains in parallel
         // makes the order within a bucket nondeterministic, which only affects *which*
         // equally-good candidate is found first, never correctness.
-        let head_a: &[AtomicI32] = unsafe { &*(head as *const [i32] as *const [AtomicI32]) };
-        let prev_a: &[AtomicI32] = unsafe { &*(prev as *const [i32] as *const [AtomicI32]) };
+        // The casts must go through `*mut` to keep write provenance: `&mut [i32] as
+        // *const [i32]` would reborrow through a shared read-only reference first,
+        // making the atomic stores below undefined behavior (flagged by Miri).
+        let head_a: &[AtomicI32] = unsafe { &*(head as *mut [i32] as *const [AtomicI32]) };
+        let prev_a: &[AtomicI32] = unsafe { &*(prev as *mut [i32] as *const [AtomicI32]) };
         (0..m).into_par_iter().for_each(|i| {
             let b = hash8(&old[i..]);
             let old_head = head_a[b].swap(i as i32, Ordering::Relaxed);
@@ -240,7 +243,11 @@ fn diff_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Write) 
     let mut lastpos = 0;
     let mut lastoffset = 0isize;
     while scan < new.len() {
-        let mut oldscore = 0;
+        // Signed, as in the original bsdiff: the `oldscore -= 1` below can legitimately
+        // drive it negative when the matcher returns len == 0 for a position whose byte
+        // still matches at lastoffset (scsc has not counted it yet; it will later, and
+        // the negative value pre-compensates for that double count).
+        let mut oldscore: isize = 0;
         scan += len;
         let mut scsc = scan;
         while scan < new.len() {
@@ -255,7 +262,7 @@ fn diff_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Write) 
                 }
                 scsc += 1;
             }
-            if len == oldscore && (len != 0) || len > oldscore + 8 {
+            if len as isize == oldscore && (len != 0) || len as isize > oldscore + 8 {
                 break;
             }
             if scan as isize + lastoffset < old.len() as _
@@ -265,7 +272,7 @@ fn diff_scan(old: &[u8], new: &[u8], matcher: &Matcher, writer: &mut dyn Write) 
             }
             scan += 1;
         }
-        if !(len != oldscore || scan == new.len()) {
+        if !(len as isize != oldscore || scan == new.len()) {
             continue;
         }
         let mut s = 0;
